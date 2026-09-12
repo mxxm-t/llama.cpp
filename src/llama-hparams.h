@@ -9,6 +9,9 @@
 
 // bump if necessary
 #define LLAMA_MAX_LAYERS  512
+#define LLAMA_MAX_ENGRAM_LAYERS  8
+#define LLAMA_MAX_ENGRAM_NGRAM   8
+#define LLAMA_MAX_ENGRAM_COLS   64
 #define LLAMA_MAX_EXPERTS 1024 // Kimi K3
 #define LLAMA_MAX_PLE_NGRAM 8  // qwen4exp
 #define LLAMA_MAX_PLE_HEADS 64 // qwen4exp
@@ -273,6 +276,77 @@ struct llama_hparams {
     uint32_t dsv4_o_group_count        = 0;
     uint32_t dsv4_o_lora_rank          = 0;
     uint32_t dsv4_hc_mult              = 0;
+
+    // DeepSeek-V4.1 Engram: an n-gram hash table written into the residual at a few layers.
+    // The primes, multipliers and compressed token map are baked into the GGUF because they come from a sympy prime search, a numpy PCG64 stream and a HuggingFace normalizer chain.
+    uint32_t engram_head_dim           = 0;
+    uint32_t engram_n_heads            = 0;
+    uint32_t engram_max_ngram_size     = 0;
+    uint32_t engram_pad_token_id       = 0;
+    uint32_t engram_compressed_vocab   = 0;
+    // llama_hparams must stay trivially copyable, so these are bounded arrays and the vocab-sized token map lives on the model instead.
+    // V4.1 keeps the KV compressor and the indexer on source layers that other layers reuse.
+    // The compressed tiers, by ratio.
+    // V4 runs 4 (with an indexer) and 128; V4.1 runs 2 and 1.
+    // Ratio 1 pools a single token, where the pooling softmax is the identity, so that tier needs no gate and its source layer ships no attn_comp_wgate.
+    uint32_t dsv4_ratio_idx            = 4;
+    uint32_t dsv4_ratio_plain          = 128;
+
+    uint32_t dsv41_n_kv_source         = 0;
+    uint32_t dsv41_n_index_source      = 0;
+    uint32_t dsv41_candidate_src_layer = 0;
+    uint32_t dsv41_candidate_block     = 0;
+    uint32_t dsv41_candidate_topk      = 0;
+    std::array<uint32_t, LLAMA_MAX_LAYERS> dsv41_kv_source_layers    = {};
+    std::array<uint32_t, LLAMA_MAX_LAYERS> dsv41_index_source_layers = {};
+
+    bool dsv41_is_kv_source(uint32_t il) const {
+        for (uint32_t i = 0; i < dsv41_n_kv_source; ++i) {
+            if (dsv41_kv_source_layers[i] == il) { return true; }
+        }
+        return false;
+    }
+
+    // The nearest KV source at or before il, whose compressed cache this layer reads.
+    // V4 compresses on every ratio layer and has no source list, so it gets -1 and is its own.
+    int dsv41_kv_source_for(uint32_t il) const {
+        int best = -1;
+        for (uint32_t i = 0; i < dsv41_n_kv_source; ++i) {
+            const int s = (int) dsv41_kv_source_layers[i];
+            if (s <= (int) il && s > best) {
+                best = s;
+            }
+        }
+        return best;
+    }
+
+    bool dsv41_is_index_source(uint32_t il) const {
+        for (uint32_t i = 0; i < dsv41_n_index_source; ++i) {
+            if (dsv41_index_source_layers[i] == il) { return true; }
+        }
+        return false;
+    }
+
+    uint32_t engram_n_layers           = 0;
+    std::array<uint32_t, LLAMA_MAX_ENGRAM_LAYERS> engram_layer_ids      = {};
+    std::array<uint64_t, LLAMA_MAX_ENGRAM_LAYERS> engram_num_embeddings = {};
+    std::array<uint64_t, LLAMA_MAX_ENGRAM_LAYERS*LLAMA_MAX_ENGRAM_NGRAM> engram_multipliers = {};
+    std::array<uint64_t, LLAMA_MAX_ENGRAM_LAYERS*LLAMA_MAX_ENGRAM_COLS>  engram_primes      = {};
+    std::array<uint64_t, LLAMA_MAX_ENGRAM_LAYERS*LLAMA_MAX_ENGRAM_COLS>  engram_offsets     = {};
+
+    // index of il in engram_layer_ids, or -1 when the layer carries no engram table
+    int engram_layer_index(uint32_t il) const {
+        for (uint32_t i = 0; i < engram_n_layers; ++i) {
+            if (engram_layer_ids[i] == il) {
+                return (int) i;
+            }
+        }
+        return -1;
+    }
+
+    uint32_t engram_n_hash_cols() const {
+        return engram_max_ngram_size > 0 ? (engram_max_ngram_size - 1) * engram_n_heads : 0;
+    }
     uint32_t dsv4_hc_sinkhorn_iters    = 0;
     uint32_t dsv4_hash_layer_count     = 0;
     float    dsv4_compress_rope_base   = 0.0f;

@@ -337,7 +337,7 @@ struct split_strategy {
                 const char * t_name = gguf_get_tensor_name(ctx_out, i);
                 struct ggml_tensor * t = ggml_get_tensor(ctx_meta, t_name);
                 auto n_bytes = ggml_nbytes(t);
-                read_buf.resize(n_bytes);
+                // no resize to n_bytes here: copy_file_to_file sizes its own chunk buffer, and a single tensor can be larger than host memory
 
                 // calculate offset
                 auto i_tensor_in = gguf_find_tensor(ctx_gguf, t_name); // idx of tensor in the input file
@@ -357,12 +357,19 @@ struct split_strategy {
 
     void copy_file_to_file(std::ifstream & f_in, std::ofstream & f_out, const size_t in_offset, const size_t len) {
         // TODO: detect OS and use copy_file_range() here for better performance
-        if (read_buf.size() < len) {
-            read_buf.resize(len);
+        // chunked for the same reason as the split path: a single tensor can exceed host memory
+        const size_t chunk = 64ull*1024*1024;
+        if (read_buf.size() < (len < chunk ? len : chunk)) {
+            read_buf.resize(len < chunk ? len : chunk);
         }
+
         f_in.seekg(in_offset);
-        f_in.read((char *)read_buf.data(), len);
-        f_out.write((const char *)read_buf.data(), len);
+        for (size_t done = 0; done < len; ) {
+            const size_t n = (len - done) < chunk ? (len - done) : chunk;
+            f_in.read((char *)read_buf.data(), n);
+            f_out.write((const char *)read_buf.data(), n);
+            done += n;
+        }
     }
 };
 
@@ -542,16 +549,24 @@ static void gguf_merge(const split_params & split_params) {
 
             auto n_bytes = ggml_nbytes(t);
 
-            if (read_data.size() < n_bytes) {
-                read_data.resize(n_bytes);
-            }
-
             auto offset = gguf_get_data_offset(ctx_gguf) + gguf_get_tensor_offset(ctx_gguf, i_tensor);
             f_input.seekg(offset);
-            f_input.read((char *)read_data.data(), n_bytes);
+
+            // One tensor can be tens of gigabytes: the two engram tables of DeepSeek-V4.1 are 52 GB each, and buffering one whole got this tool OOM-killed at 54 GB resident.
+            // Copy in fixed chunks instead, so peak memory does not depend on the tensor.
+            const size_t chunk = 64ull*1024*1024;
+            if (read_data.size() < (n_bytes < chunk ? n_bytes : chunk)) {
+                read_data.resize(n_bytes < chunk ? n_bytes : chunk);
+            }
+            for (size_t done = 0; done < n_bytes; ) {
+                const size_t n = (n_bytes - done) < chunk ? (n_bytes - done) : chunk;
+                f_input.read((char *)read_data.data(), n);
+                if (!split_params.dry_run) {
+                    fout.write((const char *)read_data.data(), n);
+                }
+                done += n;
+            }
             if (!split_params.dry_run) {
-                // write tensor data + padding
-                fout.write((const char *)read_data.data(), n_bytes);
                 zeros(fout, GGML_PAD(n_bytes, GGUF_DEFAULT_ALIGNMENT) - n_bytes);
             }
         }

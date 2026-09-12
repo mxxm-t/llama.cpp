@@ -507,6 +507,11 @@ struct llama_layer {
 
     // DeepSeek-V4
     struct ggml_tensor * attn_kv_norm = nullptr;
+    struct ggml_tensor * engram_embed = nullptr;
+    struct ggml_tensor * engram_wkv   = nullptr;
+    struct ggml_tensor * engram_q     = nullptr;
+    struct ggml_tensor * engram_k     = nullptr;
+
     struct ggml_tensor * hc_attn_fn   = nullptr;
     struct ggml_tensor * hc_attn_base = nullptr;
     struct ggml_tensor * hc_attn_scale = nullptr;

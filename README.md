@@ -12,6 +12,7 @@
 |---|---|
 | **Multi-stage tensor parallelism** | `-tps T` groups the GPUs and pipelines layers across the groups |
 | **DeepSeek-V4-Flash on `-sm tensor`** | fork routing kept after upstream's own split landed: GPU-side lightning indexer at any context length, static rollback topology |
+| **DeepSeek-V4.1-Flash on `-sm layer`** | architecture support: compressed tiers driven by model metadata, hyper-connection mix shifted by one sublayer, head fold without `output_hc_*` tensors, Engram n-gram hash memory read on demand from two 48.6 GiB tables |
 | **Qwen3.8-Flash-Next on `-sm tensor`** | PLE gather table sharded across the TP group (27 GiB on UD-Q4_K_XL, larger at higher quants), opt-in load-time prefault of that table, NextN/MTP draft head, lazy tensor read under `-lm dio` |
 | **Speculative decoding** | MTP draft heads on Qwen3.6 and Qwen3.8-Flash-Next, DSpark on DeepSeek-V4-Flash, DFlash, all under tensor parallelism, MTP KV staging, recurrent state rewound from a snapshot ring instead of rebuilt |
 | **Custom GPU AllReduce** | peer-write, beats the RCCL ring for generation over PCIe |

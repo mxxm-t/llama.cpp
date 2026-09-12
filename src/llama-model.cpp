@@ -202,6 +202,8 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
             return new llama_model_dots3note(params);
         case LLM_ARCH_DEEPSEEK4:
             return new llama_model_deepseek4(params);
+        case LLM_ARCH_DEEPSEEK41:
+            return new llama_model_deepseek41(params);
         case LLM_ARCH_GLM_DSA:
             return new llama_model_glm_dsa(params);
         case LLM_ARCH_MISTRAL4:
@@ -2280,6 +2282,17 @@ ggml_tensor * llama_model_base::create_tensor(llama_model_loader & ml, const LLM
     // which also means dropping the lazy flag - there is no file mapping to page from
     // once it lives on the devices.
     const buft_list_t * buft_list_input = pimpl->dev_input.buft_list;
+
+    // Same reasoning as the PLE table below, and the stakes are higher: the two DeepSeek-V4.1 engram tables are 48.6 GiB each, the default meta rule for an unrecognised tensor is MIRRORED, and a GET_ROWS support check that accepts them into VRAM would put a copy of each on every device.
+    // Pin them to plain CPU and let the rows page in as they are gathered.
+    if (tn.tensor == LLM_TENSOR_ENGRAM_EMBED) {
+        static const buft_list_t engram_cpu_only = {
+            { ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU),
+              ggml_backend_cpu_buffer_type() }
+        };
+        buft_list_input = &engram_cpu_only;
+    }
+
     if (tn.tensor == LLM_TENSOR_PER_LAYER_TOKEN_EMBD) {
         if (llama_ple_shard_enabled() && params.split_mode == LLAMA_SPLIT_MODE_TENSOR &&
                 !pimpl->dev_layer.empty()) {
@@ -2841,6 +2854,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                 }
             } break;
         case LLM_ARCH_DEEPSEEK4:
+        case LLM_ARCH_DEEPSEEK41:
             {
                 GGML_ASSERT(hparams.swa_type != LLAMA_SWA_TYPE_NONE);
 
@@ -3345,6 +3359,7 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
         case LLM_ARCH_DEEPSEEK2OCR:
         case LLM_ARCH_DEEPSEEK32:
         case LLM_ARCH_DEEPSEEK4:
+        case LLM_ARCH_DEEPSEEK41:
         case LLM_ARCH_MUSE_GLIMMER:
         case LLM_ARCH_PLM:
         case LLM_ARCH_CHATGLM:

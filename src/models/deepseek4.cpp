@@ -99,9 +99,9 @@ void llama_model_deepseek4::load_arch_tensors(llama_model_loader & ml) {
     output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), {n_embd}, 0);
     output      = create_tensor(tn(LLM_TENSOR_OUTPUT,      "weight"), {n_embd, n_vocab}, 0);
 
-    hc_head_fn    = create_tensor(tn(LLM_TENSOR_HC_HEAD_FN, "weight"),    {hc_dim, hc_mult}, 0);
-    hc_head_base  = create_tensor(tn(LLM_TENSOR_HC_HEAD_BASE, "weight"),  {hc_mult}, 0);
-    hc_head_scale = create_tensor(tn(LLM_TENSOR_HC_HEAD_SCALE, "weight"), {1}, 0);
+    hc_head_fn    = create_tensor(tn(LLM_TENSOR_HC_HEAD_FN, "weight"),    {hc_dim, hc_mult}, head_hc_flags);
+    hc_head_base  = create_tensor(tn(LLM_TENSOR_HC_HEAD_BASE, "weight"),  {hc_mult}, head_hc_flags);
+    hc_head_scale = create_tensor(tn(LLM_TENSOR_HC_HEAD_SCALE, "weight"), {1}, head_hc_flags);
 
     for (int i = 0; i < n_layer_all; ++i) {
         auto & layer = layers[i];
@@ -258,8 +258,6 @@ static dsv4_state_tensors dsv4_build_state_snapshot(
     return { kv, score };
 }
 
-static constexpr int64_t DSV4_CSA_RATIO  = 4;
-static constexpr int64_t DSV4_HCA_RATIO  = 128;
 
 // mean over the hyper-connection streams: [n_embd, hc, n_tokens] -> [n_embd, n_tokens]
 static ggml_tensor * dsv4_hc_mean(ggml_context * ctx, ggml_tensor * x) {
@@ -346,6 +344,17 @@ ggml_tensor * llama_model_deepseek4::graph::build_hc_sinkhorn(
     return comb;
 }
 
+ggml_tensor * llama_model_deepseek4::graph::build_head_fold(const llama_model & model, ggml_tensor * x) const {
+    if (model.hc_head_fn == nullptr) {
+        // V4.1: fold with the mix the last layer computed from its pre-FFN input.
+        // Recomputing one here from the post-FFN residual would not be the same value.
+        GGML_ASSERT(last_ffn_pre != nullptr);
+        return build_hc_pre(x, last_ffn_pre, -1);
+    }
+
+    return build_hc_head(x, model.hc_head_fn, model.hc_head_scale, model.hc_head_base);
+}
+
 ggml_tensor * llama_model_deepseek4::graph::build_hc_pre(
         ggml_tensor * x,
         ggml_tensor * hc_fn,
@@ -353,7 +362,9 @@ ggml_tensor * llama_model_deepseek4::graph::build_hc_pre(
         ggml_tensor * hc_base,
         ggml_tensor ** post,
         ggml_tensor ** comb,
-        int il) const {
+        int il,
+        ggml_tensor ** pre_out,
+        ggml_tensor  * mix_in) const {
     const int64_t hc         = hparams.dsv4_hc_mult;
     const int64_t hc_dim     = hc*n_embd;
     const int64_t hc_mix_dim = (2 + hc)*hc;
@@ -379,6 +390,10 @@ ggml_tensor * llama_model_deepseek4::graph::build_hc_pre(
     pre = ggml_scale_bias(ctx0, pre, 1.0f, hparams.dsv4_hc_eps);
     cb(pre, "hc_pre", il);
 
+    if (pre_out) {
+        *pre_out = pre;
+    }
+
     *post = dsv4_view_2d(ctx0, mixes, hc, nt, hc);
     *post = dsv4_hc_affine(ctx0, *post, scale_post, base_post);
     *post = ggml_sigmoid(ctx0, *post);
@@ -400,7 +415,9 @@ ggml_tensor * llama_model_deepseek4::graph::build_hc_pre(
     }
     cb(*comb, "hc_comb", il);
 
-    ggml_tensor * result = build_hc_pre(x, pre, il);
+    // V4 collapses with the mix this sublayer just computed.
+    // V4.1 hands its coefficients to the NEXT sublayer instead - attention uses the previous block's ffn mix, the FFN uses this block's attention mix - so the caller passes the carried one.
+    ggml_tensor * result = build_hc_pre(x, mix_in ? mix_in : pre, il);
     return result;
 }
 
@@ -469,6 +486,7 @@ ggml_tensor * llama_model_deepseek4::graph::build_hca_compressed_kv_from_state(
         ggml_tensor * state_read_idxs,
         ggml_tensor * comp_pos,
         ggml_tensor * norm,
+        int64_t ratio,
         int64_t n_embd_head,
         const char * name,
         int il) const {
@@ -478,15 +496,16 @@ ggml_tensor * llama_model_deepseek4::graph::build_hca_compressed_kv_from_state(
 
     GGML_ASSERT(n_blocks > 0);
     GGML_ASSERT(state_read_idxs);
-    GGML_ASSERT(state_read_idxs->ne[0] == DSV4_HCA_RATIO*n_blocks);
+    GGML_ASSERT(state_read_idxs->ne[0] == ratio*n_blocks);
     GGML_ASSERT(n_embd_head >= n_embd_head_rope);
 
     ggml_tensor * kv = ggml_get_rows(ctx0, kv_state, state_read_idxs);
-    kv = ggml_reshape_3d(ctx0, kv, n_embd_head, DSV4_HCA_RATIO, n_blocks);
+    kv = ggml_reshape_3d(ctx0, kv, n_embd_head, ratio, n_blocks);
     cb(kv, name, il);
 
+    // at ratio 1 the softmax below runs over a single element and is the identity, which is why a ratio 1 source layer needs no gate at all and the file carries no attn_comp_wgate for it
     ggml_tensor * score = ggml_get_rows(ctx0, score_state, state_read_idxs);
-    score = ggml_reshape_3d(ctx0, score, n_embd_head, DSV4_HCA_RATIO, n_blocks);
+    score = ggml_reshape_3d(ctx0, score, n_embd_head, ratio, n_blocks);
     cb(score, name, il);
 
     ggml_tensor * values = ggml_cont(ctx0, ggml_permute(ctx0, kv, 1, 0, 2, 3));
@@ -768,8 +787,12 @@ ggml_tensor * llama_model_deepseek4::graph::build_hca_attention(
         ggml_tensor * kv,
         ggml_tensor * sinks,
         float kq_scale,
-        int il) const {
-    const auto & inp_hca = inp_dsv4->get_hca();
+        int il,
+        int il_kv,
+        bool idx_tier) const {
+    // il_kv is the layer that owns the compressed rows.
+    // For V4 that is this layer; V4.1 has the layers after a source read the source's cache, which is the only place they differ.
+    const auto & inp_hca = idx_tier ? inp_dsv4->get_csa() : inp_dsv4->get_hca();
     GGML_ASSERT(inp_hca.kq_mask);
 
     ggml_tensor * k_rot = inp_attn->self_k_rot;
@@ -788,7 +811,7 @@ ggml_tensor * llama_model_deepseek4::graph::build_hca_attention(
     ggml_tensor * raw_k = mctx_raw->get_k(ctx0, il);
     cb(raw_k, "hca_raw_k", il);
 
-    ggml_tensor * hca_k = inp_dsv4->mctx->get_hca()->get_k(ctx0, il);
+    ggml_tensor * hca_k = (idx_tier ? inp_dsv4->mctx->get_csa() : inp_dsv4->mctx->get_hca())->get_k(ctx0, il_kv);
     const int64_t n_hca = inp_hca.kq_mask->ne[0];
     GGML_ASSERT(n_hca > 0);
     GGML_ASSERT(n_hca <= hca_k->ne[2]);
@@ -911,7 +934,16 @@ ggml_tensor * llama_model_deepseek4::graph::build_attention_impl(
 
     ggml_tensor * q = build_lora_mm(layer.wq_b, qr);
     q = ggml_reshape_3d(ctx0, q, n_embd_head, n_head, nt);
-    q = ggml_rms_norm(ctx0, q, norm_rms_eps);
+    // V4 renormalizes q per head after wq_b.
+    // V4.1 does not: its only query norm is the one on wq_a's output, and this second one rescales every head's attention scores.
+    // LLAMA_DSV41_QNORM=1 puts it back for A/B.
+    static const bool q_norm_off = [] {
+        const char * e = getenv("LLAMA_DSV41_QNORM");
+        return !(e != nullptr && atoi(e) != 0);
+    }();
+    if (!(hparams.dsv41_n_kv_source > 0 && q_norm_off)) {
+        q = ggml_rms_norm(ctx0, q, norm_rms_eps);
+    }
     cb(q, "q_norm", il);
 
     q = ggml_rope_ext(ctx0, q, inp_pos, nullptr, n_embd_head_rope, rope_type, n_ctx_orig_l,
@@ -932,26 +964,58 @@ ggml_tensor * llama_model_deepseek4::graph::build_attention_impl(
     const int64_t ratio = hparams.dsv4_compress_ratios[il];
     GGML_ASSERT(inp_dsv4 || ratio == 0);
 
+    // Which compressed tier this layer belongs to, and who owns its KV.
+    // V4 compresses on every ratio layer, so each is its own source and both tiers keep their V4 shapes.
+    // V4.1 pools non-overlapping groups on both tiers and writes only on a source layer, which the layers after it read.
+    const bool v41        = hparams.dsv41_n_kv_source > 0;
+    const bool tier_idx   = ratio != 0 && (uint32_t) ratio == hparams.dsv4_ratio_idx;
+    const bool tier_plain = ratio != 0 && (uint32_t) ratio == hparams.dsv4_ratio_plain;
+    const int  kv_src     = (v41 && ratio != 0) ? hparams.dsv41_kv_source_for(il) : il;
+    const bool owns_kv    = ratio != 0 && kv_src == il;
+
+    GGML_ASSERT(!(v41 && ratio != 0) || kv_src >= 0);
+
+    // LLAMA_DSV41_NO_COMPRESS=1 drops the compressed tier and leaves every layer on its 128-token sliding window, to tell a broken compressed path from a broken stack.
+    // RoPE is left alone so only one thing changes.
+    static const bool compress_off = [] {
+        const char * e = getenv("LLAMA_DSV41_NO_COMPRESS");
+        const bool off = e != nullptr && atoi(e) != 0;
+        if (off) {
+            LLAMA_LOG_WARN("deepseek41: LLAMA_DSV41_NO_COMPRESS=1, compressed tier disabled\n");
+        }
+        return off;
+    }();
+
+    // the pooled compressor serves V4's plain tier, and both of V4.1's
+    const bool pooled   = (v41 ? owns_kv : tier_plain) && !(v41 && compress_off);
+    const auto & tier   = inp_dsv4 ? (v41 && tier_idx ? inp_dsv4->get_csa() : inp_dsv4->get_hca())
+                                   : inp_dsv4->get_hca();
+    const int64_t tier_ratio = ratio;
+
     ggml_tensor * hca_state_kv    = nullptr;
     ggml_tensor * hca_state_score = nullptr;
     ggml_tensor * hca_source_kv   = nullptr;
     ggml_tensor * hca_source_score = nullptr;
-    if (ratio == DSV4_HCA_RATIO && inp_dsv4->get_hca().state_pos) {
+    if (pooled && tier.state_pos) {
         hca_state_kv = build_lora_mm(layer.attn_comp_wkv, cur);
-        cb(hca_state_kv, "hca_state_kv", il);
+        cb(hca_state_kv, "comp_state_kv", il);
 
-        hca_state_score = build_lora_mm(layer.attn_comp_wgate, cur);
-        cb(hca_state_score, "hca_state_score", il);
+        // A ratio 1 tier pools one token, so its softmax is the identity and any score gives weight 1.
+        // V4.1's ratio 1 source layer ships no gate at all, hence the zeros.
+        hca_state_score = layer.attn_comp_wgate
+            ? build_lora_mm(layer.attn_comp_wgate, cur)
+            : ggml_scale(ctx0, hca_state_kv, 0.0f);
+        cb(hca_state_score, "comp_state_score", il);
 
-        ggml_tensor * ape = layer.attn_comp_ape;
-
-        ggml_tensor * ape_rows = ggml_get_rows(ctx0, ape, inp_dsv4->get_hca().state_pos);
-        hca_state_score = ggml_add(ctx0, hca_state_score, ape_rows);
-        cb(hca_state_score, "hca_state_score_ape", il);
-
+        // V4 adds a learned position embedding to the gate. V4.1 ships none.
+        if (layer.attn_comp_ape) {
+            ggml_tensor * ape_rows = ggml_get_rows(ctx0, layer.attn_comp_ape, tier.state_pos);
+            hca_state_score = ggml_add(ctx0, hca_state_score, ape_rows);
+            cb(hca_state_score, "comp_state_score_ape", il);
+        }
     }
 
-    if (ratio == DSV4_CSA_RATIO && inp_dsv4->get_csa().state_pos) {
+    if (!v41 && tier_idx && inp_dsv4->get_csa().state_pos) {
         ggml_tensor * csa_state_kv = build_lora_mm(layer.attn_comp_wkv, cur);
         cb(csa_state_kv, "csa_state_kv", il);
 
@@ -983,7 +1047,7 @@ ggml_tensor * llama_model_deepseek4::graph::build_attention_impl(
                 inp_dsv4->get_csa().state_read_idxs,
                 inp_dsv4->get_csa().state_write_pos,
                 layer.attn_comp_norm,
-                DSV4_CSA_RATIO,
+                hparams.dsv4_ratio_idx,
                 n_embd_head,
                 "csa_state_compress",
                 il);
@@ -1052,7 +1116,7 @@ ggml_tensor * llama_model_deepseek4::graph::build_attention_impl(
                 inp_dsv4->get_lid().state_read_idxs,
                 inp_dsv4->get_lid().state_write_pos,
                 layer.indexer_comp_norm,
-                DSV4_CSA_RATIO,
+                hparams.dsv4_ratio_idx,
                 hparams.indexer_head_size,
                 "lid_state_compress",
                 il);
@@ -1093,12 +1157,12 @@ ggml_tensor * llama_model_deepseek4::graph::build_attention_impl(
 
     const llama_dsv4_comp_state * hca_state = nullptr;
     dsv4_state_tensors hca_restored = {};
-    if (ratio == DSV4_HCA_RATIO && inp_dsv4->get_hca().state_write_idxs) {
+    if (pooled && tier.state_write_idxs) {
         GGML_ASSERT(hca_state_kv);
         GGML_ASSERT(hca_state_score);
 
-        hca_state = inp_dsv4->mctx->get_hca_state();
-        hca_restored = dsv4_build_state_restore(ctx0, inp_dsv4->get_hca(), hca_state, il);
+        hca_state = (v41 && tier_idx) ? inp_dsv4->mctx->get_csa_state() : inp_dsv4->mctx->get_hca_state();
+        hca_restored = dsv4_build_state_restore(ctx0, tier, hca_state, il);
         ggml_tensor * hca_base_kv = dsv4_view_2d(
                 ctx0, hca_restored.kv, hca_restored.kv->ne[0], hca_state->get_n_rows(), 0);
         ggml_tensor * hca_base_score = dsv4_view_2d(
@@ -1110,31 +1174,33 @@ ggml_tensor * llama_model_deepseek4::graph::build_attention_impl(
         ggml_tensor * kv_comp_hca = build_hca_compressed_kv_from_state(
                 hca_source_kv,
                 hca_source_score,
-                inp_dsv4->get_hca().state_read_idxs,
-                inp_dsv4->get_hca().state_write_pos,
+                tier.state_read_idxs,
+                tier.state_write_pos,
                 layer.attn_comp_norm,
+                tier_ratio,
                 n_embd_head,
-                "hca_state_compress",
+                "comp_state_compress",
                 il);
 
-        if (inp_dsv4->get_hca().k_rot) {
-            kv_comp_hca = llama_mul_mat_hadamard(ctx0, kv_comp_hca, inp_dsv4->get_hca().k_rot);
-            cb(kv_comp_hca, "hca_state_compress_rot", il);
+        if (tier.k_rot) {
+            kv_comp_hca = llama_mul_mat_hadamard(ctx0, kv_comp_hca, tier.k_rot);
+            cb(kv_comp_hca, "comp_state_compress_rot", il);
         }
 
-        ggml_build_forward_expand(gf, inp_dsv4->mctx->get_hca()->cpy_k(ctx0,
-                    kv_comp_hca, inp_dsv4->get_hca().state_write_idxs, il));
+        const auto * tier_kv = (v41 && tier_idx) ? inp_dsv4->mctx->get_csa() : inp_dsv4->mctx->get_hca();
+        ggml_build_forward_expand(gf, tier_kv->cpy_k(ctx0,
+                    kv_comp_hca, tier.state_write_idxs, il));
     }
 
-    if (ratio == DSV4_HCA_RATIO && inp_dsv4->get_hca().state_pos) {
+    if (pooled && tier.state_pos) {
         GGML_ASSERT(hca_state_kv);
         GGML_ASSERT(hca_state_score);
 
         if (hca_state == nullptr) {
-            hca_state = inp_dsv4->mctx->get_hca_state();
+            hca_state = (v41 && tier_idx) ? inp_dsv4->mctx->get_csa_state() : inp_dsv4->mctx->get_hca_state();
         }
         if (hca_restored.kv == nullptr) {
-            hca_restored = dsv4_build_state_restore(ctx0, inp_dsv4->get_hca(), hca_state, il);
+            hca_restored = dsv4_build_state_restore(ctx0, tier, hca_state, il);
         }
         if (hca_source_kv == nullptr || hca_source_score == nullptr) {
             ggml_tensor * hca_base_kv = dsv4_view_2d(
@@ -1152,7 +1218,7 @@ ggml_tensor * llama_model_deepseek4::graph::build_attention_impl(
                 hca_restored.score, hca_state_score, 1);
 
         const dsv4_state_tensors hca_snapshot = dsv4_build_state_snapshot(
-                ctx0, inp_dsv4->get_hca(), hca_state, hca_snapshot_source_kv, hca_snapshot_source_score, il);
+                ctx0, tier, hca_state, hca_snapshot_source_kv, hca_snapshot_source_score, il);
         if (hca_snapshot.kv != nullptr) {
             ggml_build_forward_expand(gf, hca_snapshot.kv);
         }
@@ -1160,13 +1226,13 @@ ggml_tensor * llama_model_deepseek4::graph::build_attention_impl(
             ggml_build_forward_expand(gf, hca_snapshot.score);
         }
 
-        ggml_tensor * hca_persist_kv = ggml_get_rows(ctx0, hca_state_kv, inp_dsv4->get_hca().state_persist_src_idxs);
-        ggml_tensor * hca_persist_score = ggml_get_rows(ctx0, hca_state_score, inp_dsv4->get_hca().state_persist_src_idxs);
+        ggml_tensor * hca_persist_kv = ggml_get_rows(ctx0, hca_state_kv, tier.state_persist_src_idxs);
+        ggml_tensor * hca_persist_score = ggml_get_rows(ctx0, hca_state_score, tier.state_persist_src_idxs);
 
-        hca_state_kv = inp_dsv4->mctx->get_hca_state()->cpy_kv(ctx0,
-                hca_persist_kv, inp_dsv4->get_hca().state_persist_dst_idxs, il);
-        hca_state_score = inp_dsv4->mctx->get_hca_state()->cpy_score(ctx0,
-                hca_persist_score, inp_dsv4->get_hca().state_persist_dst_idxs, il);
+        hca_state_kv = hca_state->cpy_kv(ctx0,
+                hca_persist_kv, tier.state_persist_dst_idxs, il);
+        hca_state_score = hca_state->cpy_score(ctx0,
+                hca_persist_score, tier.state_persist_dst_idxs, il);
 
         ggml_build_forward_expand(gf, hca_state_kv);
         ggml_build_forward_expand(gf, hca_state_score);
@@ -1180,16 +1246,16 @@ ggml_tensor * llama_model_deepseek4::graph::build_attention_impl(
                 nullptr, layer.attn_sinks, nullptr,
                 1.0f/sqrtf(float(n_embd_head)), il);
         cb(out, "attn_raw", il);
-    } else if (ratio == DSV4_CSA_RATIO &&
+    } else if (!v41 && tier_idx &&
             inp_dsv4->get_csa().kq_mask &&
             inp_dsv4->get_lid().kq_mask &&
             inp_dsv4->get_lid().k_rot) {
         out = build_csa_lid_attention(model, inp_dsv4, inp_attn, q, kv, qr, cur, inp_pos, layer.attn_sinks,
                 1.0f/sqrtf(float(n_embd_head)), il);
-    } else if (ratio == DSV4_HCA_RATIO &&
-            inp_dsv4->get_hca().kq_mask) {
+    } else if (ratio != 0 && tier.kq_mask && !(v41 && compress_off)) {
+        // the compressed rows live on the source layer, which for V4 is this layer itself
         out = build_hca_attention(inp_dsv4, inp_attn, q, kv, layer.attn_sinks,
-                1.0f/sqrtf(float(n_embd_head)), il);
+                1.0f/sqrtf(float(n_embd_head)), il, kv_src, v41 && tier_idx);
     } else {
         out = build_raw_attention(inp_attn, q, kv, layer.attn_sinks,
                 1.0f/sqrtf(float(n_embd_head)), il);
@@ -1230,6 +1296,29 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
     inpL = ggml_repeat_4d(ctx0, inpL, n_embd, hc, n_tokens, 1);
     cb(inpL, "hc_init", -1);
 
+    // V4.1 shifts the hyper-connection coefficients by one sublayer, so the mix a sublayer computes is carried to the next one.
+    // The run starts from a one-hot mix on copy 0, and collapsing with a one-hot is just selecting that copy, so no constant tensor is needed.
+    const bool hc_shift = model.hc_head_fn == nullptr;
+    ggml_tensor * carry_pre = nullptr;
+
+    // LLAMA_DSV41_NO_ENGRAM=1 skips the engram contribution, to tell a broken gate from a broken stack.
+    // The flag is read here rather than inside the loop because an input that no consumer reads is still expanded, and an expanded input with no buffer aborts at load.
+    static const bool engram_off = [] {
+        const char * e = getenv("LLAMA_DSV41_NO_ENGRAM");
+        const bool off = e != nullptr && atoi(e) != 0;
+        if (off) {
+            LLAMA_LOG_WARN("deepseek41: LLAMA_DSV41_NO_ENGRAM=1, engram disabled\n");
+        }
+        return off;
+    }();
+
+    // one row index per hash column per table, hashed host side from the token history
+    ggml_tensor * inp_engram = nullptr;
+    if (hparams.engram_n_layers > 0 && !engram_off) {
+        inp_engram = build_inp_engram(model);
+        ggml_build_forward_expand(gf, inp_engram);
+    }
+
     for (int il = 0; il < n_layer; ++il) {
         if ((size_t) il < cparams.embeddings_layer_inp.size() && cparams.embeddings_layer_inp[il]) {
             res->t_layer_inp[il] = dsv4_hc_mean(ctx0, inpL);
@@ -1240,15 +1329,27 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
             // boundary under -sm layer (measured 65 vs 51 splits)
         }
 
+        // the engram writes into the residual before the block body, so the whole layer sees it.
+        if (!engram_off && model.layers[il].engram_embed) {
+            inpL = build_engram(model, inpL, inp_engram, il);
+            cb(inpL, "engram_out", il);
+        }
+
         ggml_tensor * residual = inpL;
         ggml_tensor * post = nullptr;
         ggml_tensor * comb = nullptr;
 
+        ggml_tensor * attn_pre = nullptr;
         cur = build_hc_pre(inpL,
                 model.layers[il].hc_attn_fn,
                 model.layers[il].hc_attn_scale,
                 model.layers[il].hc_attn_base,
-                &post, &comb, il);
+                &post, &comb, il, &attn_pre, hc_shift ? carry_pre : nullptr);
+        if (hc_shift && carry_pre == nullptr) {
+            // the initial one-hot mix selects copy 0
+            cur = ggml_cont_2d(ctx0, ggml_view_2d(ctx0, inpL, n_embd, inpL->ne[2], inpL->nb[2], 0),
+                    n_embd, inpL->ne[2]);
+        }
         cb(cur, "hc_attn_pre", il);
 
         cur = build_norm(cur, model.layers[il].attn_norm, nullptr, LLM_NORM_RMS, il);
@@ -1264,7 +1365,10 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
                 model.layers[il].hc_ffn_fn,
                 model.layers[il].hc_ffn_scale,
                 model.layers[il].hc_ffn_base,
-                &post, &comb, il);
+                &post, &comb, il, &last_ffn_pre, hc_shift ? attn_pre : nullptr);
+        if (hc_shift) {
+            carry_pre = last_ffn_pre;
+        }
         cb(cur, "hc_ffn_pre", il);
 
         ggml_build_forward_expand(gf, residual);
@@ -1333,9 +1437,16 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
 
     if (inp_out_ids) {
         inpL = ggml_reshape_3d(ctx0, flat_out, n_embd, hc, n_outputs);
+
+        // V4.1 folds with the mix the last layer computed, and that mix has one row per token. build_hc_pre() takes its row count from x, so once x is narrowed to the output rows an un-narrowed mix silently supplies row 0 - the first token's coefficients applied to the last token.
+        // Narrow it the same way.
+        if (last_ffn_pre) {
+            last_ffn_pre = ggml_get_rows(ctx0, last_ffn_pre, inp_out_ids);
+            cb(last_ffn_pre, "hc_ffn_pre_out", -1);
+        }
     }
 
-    cur = build_hc_head(inpL, model.hc_head_fn, model.hc_head_scale, model.hc_head_base);
+    cur = build_head_fold(model, inpL);
     cb(cur, "hc_head", -1);
 
     cur = build_norm(cur, model.output_norm, nullptr, LLM_NORM_RMS, -1);
@@ -1473,7 +1584,7 @@ llama_model_deepseek4::graph_mtp::graph_mtp(const llama_model & model, const llm
 
     inpL = ggml_reshape_3d(ctx0, h_nextn, n_embd, hc, n_outputs);
 
-    cur = build_hc_head(inpL, model.hc_head_fn, model.hc_head_scale, model.hc_head_base);
+    cur = build_head_fold(model, inpL);
     cb(cur, "mtp_hc_head", -1);
 
     ggml_tensor * head_norm_w = layer.nextn.shared_head_norm ? layer.nextn.shared_head_norm : model.output_norm;

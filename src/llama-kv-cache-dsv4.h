@@ -215,6 +215,9 @@ public:
     void set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
     void set_input_k_rot(ggml_tensor * dst) const;
 
+    // see llama_kv_cache::get_prev_tokens() - the n-gram hash of the engram needs the tokens before each position, and the sliding-window cells are where DSV4 keeps them
+    void get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const;
+
 private:
     size_t i_next = 0;
 

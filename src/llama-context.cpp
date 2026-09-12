@@ -447,12 +447,12 @@ llama_context::llama_context(
 
         // TODO: move these checks to ggml_backend_sched
         // enabling pipeline parallelism in the scheduler increases memory usage, so it is only done when necessary
-        // -sm tensor with -tps T < n_devs creates an internally multi-stage Meta device that
-        // benefits from sched n_copies>1 (multiple ubatches in flight across stages); the
-        // model exposes only one llama_device (the Meta) so model.n_devices() == 1, hence
-        // the n_devices > 1 gate is replaced by a per-mode guard.
+        // -sm tensor with -tps T < n_devs creates an internally multi-stage Meta device that benefits from sched n_copies>1 (multiple ubatches in flight across stages); the model exposes only one llama_device (the Meta) so model.n_devices() == 1, hence the n_devices > 1 gate is replaced by a per-mode guard.
+        // The test is meant to say every layer is on a GPU.
+        // Strictly-greater only holds when the user overshoots -ngl, which for a model this size forces a split that does not fit: 41 units over 10 devices leaves one card with five layers and no -ts value avoids it.
+        // The auto-fitter does place all n_layer_all layers on GPU and lands exactly on equality, so >= enables the ring in precisely the case the condition was describing.
         bool pipeline_parallel =
-            model.n_gpu_layers() > model.hparams.n_layer_all &&
+            model.n_gpu_layers() >= model.hparams.n_layer_all &&
             cparams.offload_kqv &&
             !model.has_tensor_overrides() &&
             ((model.split_mode() == LLAMA_SPLIT_MODE_LAYER && model.n_devices() > 1) ||
